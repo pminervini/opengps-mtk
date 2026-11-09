@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# opengps: drives the MT6755 connsys GPS core and serves NMEA on a pty for gpsd.
+#
+# Install: copy opengps/ to /usr/local/lib/opengps, this file to /etc/systemd/system/, then
+#   systemctl enable --now opengps
+# and point gpsd at the pty, e.g. in /etc/default/gpsd:
+#   DEVICES="/run/opengps/gps0"
+#   GPSD_OPTIONS="-n"
+#
+# Without a known position (no --pos, no last fix in /var/lib/opengps) ogps does a cold start.
+# --download fetches today's broadcast orbits (needs network; drop it for satellites-only operation).
+
+[Unit]
+Description=opengps - open-source GPS engine for the MediaTek MT6755 connsys GPS core
+Wants=network-online.target
+After=network-online.target time-sync.target
+Before=gpsd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/opengps/ogps.py --download --pty /run/opengps/gps0
+StateDirectory=opengps
+RuntimeDirectory=opengps
+RuntimeDirectoryPreserve=no
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
