@@ -41,6 +41,8 @@ firmware image is selected by its SHA-256, so other chips need their hash added 
   out-of-tree `conn_soc` driver from
   [mt6572-connsys-modules](https://github.com/buddyjojo/mt6572-connsys-modules), which needs to
   be adapted to your SoC.
+  The tablet this was developed on runs mainline Linux with
+  [linux-mt6750-tablet](https://github.com/pminervini/linux-mt6750-tablet) (kernel patches, notes).
 - The GPS RF front-end powered: the right PMIC supplies (on MT6750 with the MT6353 PMIC this
   includes VTCXO24) and the LNA enable GPIO, as on the stock kernel.
 - Python 3 (3.9 or later) and numpy.
