@@ -412,11 +412,23 @@ class Daemon:
         if getattr(self, "nmea", None):
             for sent in nmea_sentences(now_gpst(), lat, lon, h, [], 100.0):
                 self.nmea.write(sent + "\r\n")
+        self.save_state()
+
+    def save_state(self):
+        """last position (median of the recent fixes) and the learned crystal model, for the next
+        start; written atomically"""
+        if not self.fixes or not getattr(self, "state", None):
+            return
+        import json
+        lat, lon, h = (float(v) for v in np.median(np.array(self.fixes[-30:]), axis=0))
         try:
-            import json
-            json.dump(dict(lat=lat, lon=lon, h=h, t=time.time(), fe10_c0=self.fe10_c0, fe10_c1=self.fe10_c1, temp=self.temp),
-                      open(self.state, "w"))
-        except (OSError, AttributeError):
+            tmp = self.state + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(dict(lat=lat, lon=lon, h=h, t=time.time(), fe10_c0=self.fe10_c0,
+                               fe10_c1=self.fe10_c1, temp=self.temp), f)
+            os.replace(tmp, self.state)
+            self.saved = len(self.fixes)
+        except OSError:
             pass
 
     def batch_poll(self):
@@ -488,8 +500,14 @@ class Daemon:
             self.log.write(msg + "\n")
 
     def run(self, secs):
-        t0 = time.monotonic()
+        t0 = last_save = time.monotonic()
+        tty = sys.stdout.isatty()
+        shown = None
         while not secs or time.monotonic() - t0 < secs:
+            if time.monotonic() - last_save > 600:                # long runs (service): save every 10 min
+                last_save = time.monotonic()
+                if len(self.fixes) != getattr(self, "saved", 0):
+                    self.save_state()
             f = self.c.recv(1.0)
             if not f:
                 continue
@@ -500,7 +518,9 @@ class Daemon:
             if f.mtype == 0xFE2C:
                 ms = (p[0] | p[1] << 8) << 16 | (p[2] | p[3] << 8)
                 self.on_epoch(ms)
-                print("%s epoch ms=%6d locked=%d" % (time.strftime("%H:%M:%S"), ms, self.locked), flush=True)
+                if tty or self.locked != shown or self.epochs % 60 == 0:   # quieter under systemd
+                    print("%s epoch ms=%6d locked=%d" % (time.strftime("%H:%M:%S"), ms, self.locked), flush=True)
+                    shown = self.locked
             elif f.mtype == 0xFE3B and len(p) >= 14:
                 e = self.glo.feed(p, now_gpst())
                 if e:
@@ -599,21 +619,17 @@ def main():
     d.fe10_c0, d.fe10_c1 = (float(x) for x in c0c1.split(","))
     print("crystal model: c0 %.1f Hz, c1 %.3f Hz/LSB" % (d.fe10_c0, d.fe10_c1), flush=True)
     d.fe01_drift = a.fe01drift
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # systemd stop: save the state below
     try:
         d.run(a.secs)
     finally:
         os.close(c.fd)
-    if d.fixes:
-        arr = np.array(d.fixes)
-        try:
-            import json
-            json.dump(dict(lat=float(arr[-1][0]), lon=float(arr[-1][1]), h=float(arr[-1][2]), t=time.time(),
-                           fe10_c0=d.fe10_c0 + d.fe10_c1 * (33438 - 33438), fe10_c1=d.fe10_c1, temp=d.temp), open(a.state, "w"))
-        except OSError:
-            pass
-        print("fixes: %d, median %.6f %.6f h=%.0f" % (len(arr), *np.median(arr, axis=0)))
-    else:
-        print("no fix")
+        d.save_state()
+        if d.fixes:
+            print("fixes: %d, median %.6f %.6f h=%.0f" % (len(d.fixes), *np.median(np.array(d.fixes), axis=0)), flush=True)
+        else:
+            print("no fix", flush=True)
 
 
 if __name__ == "__main__":
