@@ -113,12 +113,10 @@ def _batch_job(epochs, nav, q):
 
 
 def bringup(c, fw, cfg):
-    c.send(0xFE08, cfg)
-    c.wait(0xFE31)
+    c.request(0xFE08, cfg, 0xFE31)
     for i in range((len(fw) + CHUNK - 1) // CHUNK):
         idx = (i + 1).to_bytes(2, "little")
-        c.send(0xFE0C, idx + fw[i * CHUNK:(i + 1) * CHUNK])
-        c.wait(0xFE32, 1.0, idx)
+        c.request(0xFE0C, idx + fw[i * CHUNK:(i + 1) * CHUNK], 0xFE32, timeout=1.0, match=idx)
     c.send(0xFE05, bytes.fromhex("3200000100"))
     return c.wait(0xFE42, 2.0)
 
@@ -545,6 +543,8 @@ def main():
     ap.add_argument("--cold", action="store_true", help="cold start: no position needed; the chip searches the sky, orbits and time come from the satellites")
     ap.add_argument("--log", help="log every chip message and solver event here (large)")
     a = ap.parse_args()
+    # NMEA output first: a pty exists from the start (gpsd can open it before the first fix)
+    nmea = NmeaPty(a.pty) if a.pty else open(a.nmea, "w", buffering=1) if a.nmea else None
     nav = navmsg.NavStore.load(a.ephcache)
     if not a.nav and a.download:
         a.nav = fetch_brdc(os.path.dirname(a.ephcache))
@@ -584,7 +584,7 @@ def main():
     print("GPS core up; driving it without mnld", flush=True)
     d = Daemon(c, nav, ephem.geo2ecef(lat, lon, h), open(a.log or os.devnull, "w", buffering=1))
     d.store = navmsg.NavStore(nav, a.ephcache)
-    d.nmea = NmeaPty(a.pty) if a.pty else open(a.nmea, "w", buffering=1) if a.nmea else None
+    d.nmea = nmea
     d.state = a.state
     d.glonass = a.glonass
     d.cold = a.cold

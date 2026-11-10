@@ -59,6 +59,17 @@ class Chip:
             if f.mtype == mtype and (payload is None or f.payload[:len(payload)] == payload):
                 return f
 
+    def request(self, mtype, payload, reply, tries=4, timeout=0.5, match=None):
+        """send and wait for the reply, resending if it does not come: with Bluetooth active on
+        the same connsys link the boot ROM misses about half of the first FE08 configurations"""
+        for k in range(tries):
+            self.send(mtype, payload)
+            try:
+                return self.wait(reply, timeout, match)
+            except TimeoutError:
+                if k == tries - 1:
+                    raise
+
     def ioctl(self, cmd, arg=0):
         try:
             return fcntl.ioctl(self.fd, cmd, arg)
@@ -79,13 +90,11 @@ def main():
     t0 = time.monotonic()
     c = Chip()
     print("ioctl co_clock=%s rtc=%s" % (c.ioctl(IOC_CO_CLOCK), c.ioctl(IOC_RTC)))
-    c.send(0xFE08, cfg)
-    print("config  -> ack %s" % c.wait(0xFE31).payload.hex(" "))
+    print("config  -> ack %s" % c.request(0xFE08, cfg, 0xFE31).payload.hex(" "))
     n = (len(fw) + CHUNK - 1) // CHUNK
     for i in range(n):
         idx = (i + 1).to_bytes(2, "little")
-        c.send(0xFE0C, idx + fw[i * CHUNK:(i + 1) * CHUNK])
-        c.wait(0xFE32, 1.0, idx)
+        c.request(0xFE0C, idx + fw[i * CHUNK:(i + 1) * CHUNK], 0xFE32, timeout=1.0, match=idx)
     print("firmware %d bytes in %d chunks, all acked (%.0f ms)" % (len(fw), n, (time.monotonic() - t0) * 1e3))
     c.send(0xFE05, bytes.fromhex("3200000100"))
     f = c.wait(0xFE42, 2.0)
