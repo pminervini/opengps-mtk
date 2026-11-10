@@ -593,8 +593,17 @@ def main():
         lat, lon, h = 0.0, 0.0, 0.0
     fw = open(a.fw, "rb").read()
     cfg = bytes.fromhex("".join(l.split("#")[0] for l in open(a.config))) if a.config else gpscfg.build(a.minimal)
-    c = Chip()
-    bringup(c, fw, cfg)
+    for attempt in range(3):     # a missed reply anywhere: power-cycle the GPS function, start again
+        c = Chip()
+        try:
+            bringup(c, fw, cfg)
+            break
+        except TimeoutError as ex:
+            print("bring-up failed (%s), retrying" % ex, flush=True)
+            os.close(c.fd)
+            time.sleep(2)
+    else:
+        sys.exit("GPS core bring-up failed 3 times")
     OMIT.update(x for x in a.debug_omit.split(",") if x)
     if "init05" not in OMIT:
         for hx in INIT_FE05:
