@@ -159,6 +159,8 @@ subframes with bit errors, so an ephemeris is accepted only after two identical 
 
 **FE3B GLONASS string** (14 bytes): [0] frequency channel + 8, [2] = [3] string number, [4:14]
 five little-endian u16 words = string bits 80..1, MSB first (data 80..9, Hamming code 8..1).
+Strings that fail the Hamming check are dropped; an ephemeris needs two identical decodes. Times
+are Moscow time (UTC+3); FE29 carries the GLONASS time of day as seconds mod 65536.
 
 **FE2A GPS subframe sync** (10 bytes, every 6 s): [0] number of channels, [1:5] chip epoch
 counter (hi16, lo16), [5:7] bitmask of channels that delivered the subframe, [7:9] TOW low 16
@@ -225,8 +227,6 @@ confirmed by a second consistent solution before ogps switches to the aided loop
 - Only one device and firmware tested.
 - No almanac decoding: cold starts take at least one full ephemeris broadcast (18-30 s with a
   clean signal) per satellite.
-- The GLONASS Hamming check (`navmsg.glo_hamming_ok`) does not yet validate real strings, so
-  GLONASS strings are not error-checked.
 - FE30 and most FE08 sub-commands are not decoded; their stock values are sent.
 - The firmware does not tolerate time-inconsistent aiding: replaying captured stock commands
   (`replay.py`) makes it assert.
@@ -267,7 +267,8 @@ affiliated with them.
 ## Credits and references
 
 - IS-GPS-200 (GPS LNAV message) and the GLONASS ICD (navigation strings).
-- The GLONASS Hamming check masks are from RTKLIB (T. Takasu, BSD 2-clause).
+- The GLONASS Hamming check masks C1..C7 are from RTKLIB (T. Takasu, BSD 2-clause); C_sigma follows
+  the ICD (all 85 bits).
 - Broadcast ephemerides: IGS, via the BKG GNSS data centre.
 - [mt6572-connsys-modules](https://github.com/buddyjojo/mt6572-connsys-modules): the
   open connsys kernel driver.

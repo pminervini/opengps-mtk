@@ -335,12 +335,21 @@ def tx_gps_time(m, t_hint):
     """transmit time in GPS time for a GPS (sys 1) or GLONASS (sys 0x10) FE29 measurement"""
     if m.get("sys") != 0x10:
         return tx_from_meas(m, t_hint)
-    tod = LD(m["z"]) + LD(m["sub"] * 65536 + m["tx_chips"]) / LD(0.511e6)   # GLONASS time of day
-    u = ephem.gpst_to_unix(t_hint)
-    day0 = (u + 3 * 3600) // 86400 * 86400 - 3 * 3600                     # whole seconds: exact
-    base = day0 - 3 * 3600
-    base += round((u - (base + float(tod))) / 86400) * 86400
-    return LD(ephem.unix_to_gpst(base)) + tod
+    # FE29 carries the GLONASS (Moscow, UTC+3) time of day as seconds mod 65536 + chips at
+    # 0.511 MHz: take the full time of day closest to the hint's (handles the 16-bit wrap after
+    # 18:12 Moscow time and midnight), then step from the hint by the difference (exact in LD)
+    frac = LD(m["sub"] * 65536 + m["tx_chips"]) / LD(0.511e6)
+    tod_hint = glo_tod(t_hint)
+    best = None
+    for s in (m["z"], m["z"] + 65536):
+        if s >= 86400:
+            continue
+        d = (float(s) + float(frac) - tod_hint + 43200) % 86400 - 43200
+        if best is None or abs(d) < abs(best[1]):
+            best = (s, d)
+    s, d = best
+    day_shift = round((float(s) + float(frac) - tod_hint - d) / 86400) * 86400
+    return LD(t_hint) + (LD(s) + frac - LD(tod_hint) - LD(day_shift))
 
 
 def _eph(nav, m, t):

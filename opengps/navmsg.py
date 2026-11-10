@@ -213,8 +213,10 @@ def glo_decode(s):
         taun=_gsm(s4, 80, 59) * 2 ** -30, en=_gb(s4, 53, 49), nt=_gb(s4, 26, 16), slot=_gb(s4, 15, 11))
 
 
-# GLONASS string Hamming check masks, taken from RTKLIB (rcvraw.c, test_glostr()),
-# Copyright (c) 2007-2020 T. Takasu, BSD 2-clause license.
+# GLONASS string Hamming check masks C1..C7, taken from RTKLIB (rcvraw.c, test_glostr()),
+# Copyright (c) 2007-2020 T. Takasu, BSD 2-clause license. The 8th row is C_sigma as in the
+# GLONASS ICD (parity of all 85 bits, check bits b8..b1 included); RTKLIB's row covers only bits
+# 85..9, which on real strings failed about half of the error-free ones.
 _GLO_HAM = [[0x55, 0x55, 0x5A, 0xAA, 0xAA, 0xAA, 0xB5, 0x55, 0x6A, 0xD8, 0x08],
             [0x66, 0x66, 0x6C, 0xCC, 0xCC, 0xCC, 0xD9, 0x99, 0xB3, 0x68, 0x10],
             [0x87, 0x87, 0x8F, 0x0F, 0x0F, 0x0F, 0x1E, 0x1E, 0x3C, 0x70, 0x20],
@@ -222,12 +224,13 @@ _GLO_HAM = [[0x55, 0x55, 0x5A, 0xAA, 0xAA, 0xAA, 0xB5, 0x55, 0x6A, 0xD8, 0x08],
             [0xF8, 0x00, 0x0F, 0xFF, 0xF0, 0x00, 0x1F, 0xFF, 0xC0, 0x00, 0x80],
             [0x00, 0x00, 0x0F, 0xFF, 0xFF, 0xFF, 0xE0, 0x00, 0x00, 0x01, 0x00],
             [0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00],
-            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF8, 0x00]]
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF8]]
 
 
 def glo_hamming_ok(m, data80):
-    """GLONASS string check (Hamming, masks as in RTKLIB test_glostr): 85-bit string = idle 0,
-    string number (4 bits), bits 80..1; left aligned in 11 bytes."""
+    """GLONASS string check (ICD extended Hamming code, all eight checks zero): 85-bit string =
+    idle 0, string number (4 bits), bits 80..1; left aligned in 11 bytes. Measured on 447 real
+    strings: every string matching the repeated (majority) content passes."""
     v = ((m & 15) << 80 | data80) << 3          # 85 bits -> 88, idle bit is the MSB (0)
     buf = v.to_bytes(11, "big")
     return all(sum(bin(buf[j] & mk[j]).count("1") for j in range(11)) % 2 == 0 for mk in _GLO_HAM)
@@ -242,7 +245,7 @@ class GloStore:
 
     def feed(self, p, gpst_now):
         ch, m = p[0], p[2]
-        if not 1 <= m <= 15:
+        if not 1 <= m <= 15 or not glo_hamming_ok(m, glo_data80(p)):   # bit errors: drop the string
             return None
         d = self.str.setdefault(ch, {})
         if m == 1:
@@ -255,14 +258,15 @@ class GloStore:
         r = (e["x"] ** 2 + e["y"] ** 2 + e["z"] ** 2) ** 0.5
         if not (25.0e6 < r < 26.2e6 and 1 <= e["slot"] <= 24 and e["health"] == 0):
             return None
-        key = tuple(sorted((k, round(v, 9) if isinstance(v, float) else v) for k, v in e.items()))
+        # identical twice = accepted; tk (frame time in string 1) changes every 30 s, so not compared
+        key = tuple(sorted((k, round(v, 9) if isinstance(v, float) else v) for k, v in e.items() if k != "tk"))
         if self.pending.get(ch) != key:
             self.pending[ch] = key
             return None
         # tb (GLONASS time of day, minutes) -> GPS seconds, nearest to now
         utc_now = gpst_now - 18 + 315964800                     # GPS epoch in unix seconds
-        day0 = (utc_now + 3 * 3600) // 86400 * 86400 - 3 * 3600   # start of the GLONASS day (unix)
-        tb_unix = day0 + e["tb_min"] * 60 - 3 * 3600
+        day0 = (utc_now + 3 * 3600) // 86400 * 86400 - 3 * 3600   # start of the GLONASS (Moscow) day, unix
+        tb_unix = day0 + e["tb_min"] * 60                          # (the UTC+3 offset is in day0 already)
         if tb_unix - utc_now > 43200:
             tb_unix -= 86400
         elif utc_now - tb_unix > 43200:

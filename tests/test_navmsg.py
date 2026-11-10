@@ -87,6 +87,28 @@ def sm(v, n):
     return ((1 << (n - 1)) | (-v)) if v < 0 else v
 
 
+def with_hamming(m, data):
+    """set check bits b8..b1 of a string (data = bits 80..9 in place) so that all checks pass"""
+    data &= ~0xFF
+    for cb in range(256):
+        if navmsg.glo_hamming_ok(m, data | cb):
+            return data | cb
+    raise AssertionError("no check bits")
+
+
+def test_glonass_hamming():
+    import random
+    rnd = random.Random(1)
+    for _ in range(20):
+        m = rnd.randrange(1, 16)
+        d = with_hamming(m, rnd.getrandbits(80))
+        assert navmsg.glo_hamming_ok(m, d)
+        for bit in rnd.sample(range(80), 5):                # any single bit error is detected
+            assert not navmsg.glo_hamming_ok(m, d ^ (1 << bit))
+        a, b = rnd.sample(range(80), 2)                     # and any double error
+        assert not navmsg.glo_hamming_ok(m, d ^ (1 << a) ^ (1 << b))
+
+
 def test_glonass_strings_decode():
     x, y, z = 12345.678, -20000.25, 8000.5                # km
     vx, vy, vz = 1.234, -2.5, 3.0625                      # km/s
@@ -100,6 +122,7 @@ def test_glonass_strings_decode():
     setb(3, 35, 9, sm(round(z / 2 ** -11), 27)); setb(3, 64, 41, sm(round(vz / 2 ** -20), 24))
     setb(4, 80, 59, sm(round(3.6e-4 / 2 ** -30), 22)); setb(4, 15, 11, 21); setb(4, 26, 16, 1044)
     frames = {}
+    s = {m: with_hamming(m, v) for m, v in s.items()}
     for m, v in s.items():                               # FE3B: 5 little-endian u16 words, MSB first
         p = bytearray(14)
         p[0], p[2], p[3] = 12, m, m

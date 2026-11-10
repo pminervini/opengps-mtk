@@ -63,3 +63,15 @@ def test_multi_epoch_batch_three_satellites():
         eps.append((1000 * k, ms))
     s = pvt.solve_batch2(eps, nav, h0=70.0, step=6)
     assert s is not None and np.linalg.norm(s["pos"] - RX) < 3000
+
+
+def test_glonass_transmit_time_roundtrip():
+    """GLONASS FE29 time = Moscow time of day, seconds mod 65536 + chips at 0.511 MHz: must come
+    back as the same GPS time at any time of day (16-bit wrap after 18:12 Moscow, midnight)"""
+    for tod_target in (100.25, 40000.5, 65535.9, 65536.2, 70000.0, 86399.7):
+        t = sim.T0 + ((tod_target - pvt.glo_tod(sim.T0)) % 86400)
+        tod = pvt.glo_tod(t)
+        s = int(tod)
+        n = int(round((tod - s) * 0.511e6))
+        m = dict(z=s & 0xFFFF, sub=n >> 16, tx_chips=n & 0xFFFF, sys=0x10)
+        assert abs(float(pvt.tx_gps_time(m, t + 0.07) - pvt.LD(t))) < 1e-6, tod_target
