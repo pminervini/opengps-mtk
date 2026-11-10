@@ -373,14 +373,20 @@ class Daemon:
                 self.cold = False
                 self.clock_ok = False
                 self.came_from_cold, self.no_lock = True, 0
+                self.report_cold_fix(lat, lon, h)
             return
         if len(ms) < 4 or not self.clock_ok:
             return
         if not self.kf_init:                    # start the filter from a least-squares fix
-            if len(ms) < 5:
+            # 5 satellites (one redundant, so the residual means something); right after a cold
+            # fix only a few orbits are known: 4 are enough when the fix agrees with the cold one
+            near_cold = getattr(self, "cold_fix_pos", None) is not None
+            if len(ms) < (4 if near_cold else 5):
                 return
             s = pvt.solve(ms, self.nav, self.T, tuple(self.rx))
             if not s or float(np.sqrt(np.mean(s["resid"] ** 2))) > 50:
+                return
+            if len(s["used"]) < 5 and np.linalg.norm(s["pos"] - self.rx) > 3000:
                 return
             self.kf = pvt.EKF(s["pos"], bias_white=True)
             self.kf.ion = getattr(self, "ion", None)
@@ -408,6 +414,7 @@ class Daemon:
     def report_cold_fix(self, lat, lon, h):
         """a cold fix is a position fix: NMEA out, and saved as the start position for next time"""
         self.fixes.append((lat, lon, h))
+        self.cold_fix_pos = np.array(ephem.geo2ecef(lat, lon, h))
         print("FIX %s cold %.6f %.6f h=%.0f" % (time.strftime("%H:%M:%S", time.gmtime()), lat, lon, h), flush=True)
         if getattr(self, "nmea", None):
             for sent in nmea_sentences(now_gpst(), lat, lon, h, [], 100.0):
