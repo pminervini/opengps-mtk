@@ -121,6 +121,29 @@ def bringup(c, fw, cfg):
     return c.wait(0xFE42, 2.0)
 
 
+def tz_position():
+    """(zone, lat, lon) of the system timezone's reference city (tzdata zone1970.tab), or None:
+    a coarse position (hundreds of km) for choosing which satellites to search first"""
+    try:
+        name = open("/etc/timezone").read().strip()
+    except OSError:
+        name = os.path.realpath("/etc/localtime").split("zoneinfo/")[-1]
+    try:
+        for line in open("/usr/share/zoneinfo/zone1970.tab"):
+            f = line.split("\t")
+            if line.startswith("#") or len(f) < 3 or f[2].strip() != name:
+                continue
+            c = f[1]
+            k = max(i for i in range(1, len(c)) if c[i] in "+-")
+            def dm(s, w):
+                v = float(s[1:w + 1]) + float(s[w + 1:w + 3]) / 60 + (float(s[w + 3:w + 5]) / 3600 if len(s) > w + 3 else 0)
+                return v if s[0] == "+" else -v
+            return name, dm(c[:k], 2), dm(c[k:], 3)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 SKY = {"off": None, "cand": []}      # GPS time from the satellites: confirmed offset to the system clock
 
 
@@ -188,14 +211,46 @@ class Daemon:
         self.fe10_c0, self.fe10_c1 = 416.0, 0.475
         self.fe01_drift = 0x0F8D
         self.iono_votes = collections.Counter()
+        self.alm = navmsg.AlmanacStore()          # main() gives it a cache file
+        self.coarse = None                        # cold start: coarse position (timezone), ECEF
+
+    EPH_MAX_AGE = 4 * 3600                        # broadcast ephemerides are fitted for +-2 h
+
+    def fresh(self, prn, t):
+        e = ephem.pick(self.nav["G"].get(prn, []), t, "toe_g")
+        return bool(e) and abs(t - e["toe_g"]) < self.EPH_MAX_AGE
 
     def visible(self, t):
+        """satellites to aid with FE02: from a current ephemeris, else from the almanac (coarse,
+        km-level: acquisition only, never used for positioning)"""
         out = []
-        for prn in self.nav["G"]:
-            p = ephem.predict(self.nav, "G", prn, t, tuple(self.rx))
+        an = self.alm.nav(t) if self.alm.alm else {"G": {}}
+        for prn in sorted(set(self.nav["G"]) | set(an["G"])):
+            if self.fresh(prn, t):
+                p = ephem.predict(self.nav, "G", prn, t, tuple(self.rx))
+            elif prn in an["G"]:
+                p = ephem.predict(an, "G", prn, t, tuple(self.rx))
+                if p:
+                    p["alm"] = True
+            else:
+                continue
             if p and p["el"] > 5 and p["eph"]["health"] == 0:
                 out.append((prn, p))
         return out
+
+    def almanac_order(self):
+        """cold start with an almanac and a coarse position: GPS PRNs by elevation there, those
+        possibly above the horizon (coarse position: a few degrees) first"""
+        if not self.alm.alm or self.coarse is None:
+            return None
+        t = now_gpst()
+        an = self.alm.nav(t)
+        els = []
+        for prn in an["G"]:
+            p = ephem.predict(an, "G", prn, t, tuple(self.coarse))
+            if p and p["eph"]["health"] == 0:
+                els.append((p["el"], prn))
+        return [prn for el, prn in sorted(els, reverse=True) if el > -5]
 
     def update_clock(self, ms):
         if self.T is None:
@@ -217,6 +272,7 @@ class Daemon:
                 return
             if lk:
                 self.came_from_cold = len(lk) < 4      # trusted once 4+ satellites track
+        lk = [m for m in lk if self.fresh(m["sv"], self.T)]     # clock: current orbits only
         if lk:
             te = pvt.epoch_time(lk, self.nav, self.rx, self.T)
             if te is not None and self.clock_ok and abs(te - self.T) > 2e-3:
@@ -275,7 +331,7 @@ class Daemon:
             dop = int(round(-p["rate"] / ephem.C * ephem.L1 + self.dop_off))
             first = prn not in self.started
             self.started.add(prn)
-            if self.clock_ok:
+            if self.clock_ok and not p.get("alm"):      # almanac predictions: wide windows always
                 win, flags = (0x2A, 0x2E), b"\x02\x01\x01\x00"
             else:                      # (re)start acquisition each time the swept bin changes
                 first = first or self.epochs % 3 == 0
@@ -335,6 +391,9 @@ class Daemon:
         rest = [x for x in range(1, 33) if x not in self.MNLD_ORDER]
         k = (self.epochs // 60) % len(rest)
         order = self.MNLD_ORDER[:20] + rest[k:] + rest[:k] + self.MNLD_ORDER[20:]
+        ranked = self.almanac_order()
+        if ranked:                                 # likely visible first, then the usual order
+            order = ranked + [x for x in order if x not in ranked]
         return (locked + [x for x in order if x not in locked])[:24]
 
     def solve(self):
@@ -375,18 +434,20 @@ class Daemon:
                 self.came_from_cold, self.no_lock = True, 0
                 self.report_cold_fix(lat, lon, h)
             return
+        ms = [m for m in ms if self.fresh(m["sv"], self.T)]     # never position from stale orbits
         if len(ms) < 4 or not self.clock_ok:
             return
         if not self.kf_init:                    # start the filter from a least-squares fix
-            # 5 satellites (one redundant, so the residual means something); right after a cold
-            # fix only a few orbits are known: 4 are enough when the fix agrees with the cold one
-            near_cold = getattr(self, "cold_fix_pos", None) is not None
-            if len(ms) < (4 if near_cold else 5):
+            # 5 satellites (one redundant, so the residual means something). When orbits come only
+            # from the sky they arrive one by one: 4 are enough if the fix lies within 3 km of a
+            # trusted prior (the start position from the state/--pos, or a cold fix)
+            prior = getattr(self, "prior", None)
+            if len(ms) < (4 if prior is not None else 5):
                 return
             s = pvt.solve(ms, self.nav, self.T, tuple(self.rx))
             if not s or float(np.sqrt(np.mean(s["resid"] ** 2))) > 50:
                 return
-            if len(s["used"]) < 5 and np.linalg.norm(s["pos"] - self.rx) > 3000:
+            if len(s["used"]) < 5 and (prior is None or np.linalg.norm(s["pos"] - prior) > 3000):
                 return
             self.kf = pvt.EKF(s["pos"], bias_white=True)
             self.kf.ion = getattr(self, "ion", None)
@@ -414,7 +475,7 @@ class Daemon:
     def report_cold_fix(self, lat, lon, h):
         """a cold fix is a position fix: NMEA out, and saved as the start position for next time"""
         self.fixes.append((lat, lon, h))
-        self.cold_fix_pos = np.array(ephem.geo2ecef(lat, lon, h))
+        self.prior = np.array(ephem.geo2ecef(lat, lon, h))
         print("FIX %s cold %.6f %.6f h=%.0f" % (time.strftime("%H:%M:%S", time.gmtime()), lat, lon, h), flush=True)
         if getattr(self, "nmea", None):
             for sent in nmea_sentences(now_gpst(), lat, lon, h, [], 100.0):
@@ -500,6 +561,8 @@ class Daemon:
                 k, cnt = self.iono_votes.most_common(1)[0]
                 if cnt >= 2:
                     self.ion = self.kf.ion = dict(alpha=list(k[:4]), beta=list(k[4:]))
+        if self.alm.feed(p):
+            self.log.write("almanac: %d satellites\n" % len(self.alm.alm))
         e = self.store.feed(p, now_gpst())
         if e:
             msg = "EPH G%02d IODE %d toe %d decoded from the satellite" % (e["prn"], e["iode"], e["toe"])
@@ -567,6 +630,7 @@ def main():
     ap.add_argument("--fe01drift", type=lambda x: int(x, 0), default=0x0F8D, help="FE01 bytes 4-5: frequency uncertainty (mnld warm ~0x0f8d, cold 0x1bb4)")
     ap.add_argument("--glonass", action="store_true", help="also track GLONASS (needs RINEX GLONASS ephemeris)")
     ap.add_argument("--debug-omit", default="", help="research: leave out host messages (comma list of fe10,fe01,init05,fe08,fe04,fe1c,fe0529,fe03b)")
+    ap.add_argument("--coarse", help="cold start: rough position lat,lon (hundreds of km is fine) to search the satellites likely in view first (default: the system timezone's city)")
     ap.add_argument("--cold", action="store_true", help="cold start: no position needed; the chip searches the sky, orbits and time come from the satellites")
     ap.add_argument("--log", help="log every chip message and solver event here (large)")
     a = ap.parse_args()
@@ -619,7 +683,17 @@ def main():
             c.send(0xFE05, bytes.fromhex(hx))
     print("GPS core up; driving it without mnld", flush=True)
     d = Daemon(c, nav, ephem.geo2ecef(lat, lon, h), open(a.log or os.devnull, "w", buffering=1))
+    if not a.cold:
+        d.prior = np.array(ephem.geo2ecef(lat, lon, h))      # last fix / --pos: a trusted prior
     d.store = navmsg.NavStore(nav, a.ephcache)
+    d.alm = navmsg.AlmanacStore(os.path.join(os.path.dirname(a.ephcache) or ".", "almanac.json"))
+    if d.alm.alm:
+        print("almanac: %d satellites (cached)" % len(d.alm.alm), flush=True)
+    if a.cold:
+        tz = ("--coarse",) + tuple(float(v) for v in a.coarse.split(",")[:2]) if a.coarse else tz_position()
+        if tz:
+            d.coarse = np.array(ephem.geo2ecef(tz[1], tz[2], 0.0))
+            print("coarse position for the search order: timezone %s (%.1f, %.1f)" % tz, flush=True)
     d.nmea = nmea
     d.state = a.state
     d.glonass = a.glonass

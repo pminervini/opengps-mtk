@@ -65,6 +65,8 @@ def main():
     d.store = navmsg.NavStore(nav, os.path.join(tmp, "ephemeris.json"))
     d.nmea, d.state, d.glonass, d.cold = None, os.path.join(tmp, "last.json"), False, cold
     d.fe10_c0, d.fe10_c1 = (float(v) for v in a.fe10.split(","))
+    if not cold:
+        d.prior = np.array(ephem.geo2ecef(lat, lon, h))
     out = io.StringIO()
     t0 = time.perf_counter()
     with contextlib.redirect_stdout(out):

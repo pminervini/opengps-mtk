@@ -148,6 +148,89 @@ class NavStore:
         return {"G": {int(k): v for k, v in g.items()}, "R": {}}
 
 
+def almanac_page(ws):
+    """Subframe 4 pages 2-5/7-10 or subframe 5 pages 1-24 (SV ID 1-32, data ID 01): almanac of
+    one satellite (IS-GPS-200 20.3.3.5.1.2), or None."""
+    if subframe_id(ws) not in (4, 5) or bits(ws, 49, 2) != 1:
+        return None
+    sv = bits(ws, 51, 6)
+    if not 1 <= sv <= 32:
+        return None
+    af0 = (bits(ws, 217, 8) << 3) | bits(ws, 236, 3)
+    a = dict(prn=sv, e=bits(ws, 57, 16) * 2 ** -21, toa=bits(ws, 73, 8) * 4096,
+             di=sbits(ws, 81, 16) * 2 ** -19 * PI, omegadot=sbits(ws, 97, 16) * 2 ** -38 * PI,
+             health=bits(ws, 113, 8), sqrta=bits(ws, 121, 24) * 2 ** -11,
+             omega0=sbits(ws, 145, 24) * 2 ** -23 * PI, w=sbits(ws, 169, 24) * 2 ** -23 * PI,
+             m0=sbits(ws, 193, 24) * 2 ** -23 * PI,
+             af0=(af0 - (1 << 11) if af0 >> 10 else af0) * 2 ** -20, af1=sbits(ws, 225, 11) * 2 ** -38)
+    if not (5100 < a["sqrta"] < 5200 and a["e"] < 0.05 and abs(a["di"]) < 0.2):
+        return None
+    return a
+
+
+def almanac_eph(a, gpst_now):
+    """almanac -> ephemeris-like dict for ephem.gps_sat (coarse: km-level, for acquisition only).
+    The week is the one that puts toa nearest to now (an almanac is used for days, not weeks)."""
+    wk = int(gpst_now // 604800)
+    toa_g = wk * 604800 + a["toa"]
+    toa_g += round((gpst_now - toa_g) / 604800) * 604800
+    return dict(prn=a["prn"], sqrta=a["sqrta"], e=a["e"], i0=0.30 * PI + a["di"], omega0=a["omega0"],
+                omegadot=a["omegadot"], w=a["w"], m0=a["m0"], dn=0.0, idot=0.0, cuc=0.0, cus=0.0,
+                crc=0.0, crs=0.0, cic=0.0, cis=0.0, af0=a["af0"], af1=a["af1"], af2=0.0, tgd=0.0,
+                toe=a["toa"], toe_g=toa_g, toc=toa_g, health=0 if a["health"] == 0 else 1,
+                iode=-1, iodc=-1, week=int(toa_g // 604800), alm=True)
+
+
+class AlmanacStore:
+    """GPS almanac from subframes 4/5. A page is accepted when the same content has been decoded
+    twice (no parity from the chip). Satellites do not all carry the same upload (different toa),
+    so copies are counted per content, not compared with the last one; the newest confirmed toa
+    wins. Persisted as JSON (an almanac is usable for weeks)."""
+
+    def __init__(self, path=None):
+        self.path, self.cand = path, {}
+        self.alm = {}
+        if path:
+            import json
+            try:
+                self.alm = {int(k): v for k, v in json.load(open(path)).items()}
+            except (OSError, ValueError):
+                pass
+
+    def feed(self, p):
+        ws = words(p)
+        if ws[0] >> 16 != 0x8B:
+            return None
+        a = almanac_page(ws)
+        if not a:
+            return None
+        key = tuple(sorted(a.items()))
+        seen = self.cand.setdefault(a["prn"], {})
+        seen[key] = seen.get(key, 0) + 1
+        if len(seen) > 16:                                   # bounded: drop single-copy contents
+            for k in [k for k, n in seen.items() if n < 2][:8]:
+                del seen[k]
+        if seen[key] < 2:
+            return None
+        old = self.alm.get(a["prn"])
+        if old == a:
+            return None
+        if old and (a["toa"] - old["toa"]) % 604800 > 302400:   # older upload than the one we have
+            return None
+        self.alm[a["prn"]] = a
+        if self.path:
+            import json
+            try:
+                json.dump({str(k): v for k, v in self.alm.items()}, open(self.path, "w"))
+            except OSError:
+                pass
+        return a
+
+    def nav(self, gpst_now):
+        """{"G": {prn: [almanac as ephemeris]}} for ephem.predict"""
+        return {"G": {k: [almanac_eph(a, gpst_now)] for k, a in self.alm.items()}, "R": {}}
+
+
 def page18(ws):
     """Subframe 4 page 18 (SV ID 56): Klobuchar ionosphere + UTC parameters, or None."""
     if subframe_id(ws) != 4 or bits(ws, 51, 6) != 56:

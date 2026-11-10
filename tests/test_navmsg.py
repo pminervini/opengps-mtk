@@ -135,3 +135,35 @@ def test_glonass_strings_decode():
     assert e["tk"] == (15, 46, 30) and e["tb_min"] == 63 * 15 and e["slot"] == 21 and e["nt"] == 1044
     assert math.isclose(e["x"], x * 1e3, abs_tol=1) and math.isclose(e["y"], y * 1e3, abs_tol=1)
     assert math.isclose(e["vz"], vz * 1e3, abs_tol=1e-3) and math.isclose(e["taun"], 3.6e-4, rel_tol=1e-6)
+
+
+def almanac_page(sf, a):
+    """encode an almanac page (IS-GPS-200 20.3.3.5.1.2) for PRN a['prn'] in subframe sf"""
+    ws = [0] * 10
+    put(ws, 1, 8, 0x8B); put(ws, 25, 17, 1000); put(ws, 44, 3, sf)
+    put(ws, 49, 2, 1); put(ws, 51, 6, a["prn"])
+    put(ws, 57, 16, round(a["e"] / 2 ** -21)); put(ws, 73, 8, a["toa"] // 4096)
+    put(ws, 81, 16, round(a["di"] / PI / 2 ** -19)); put(ws, 97, 16, round(a["omegadot"] / PI / 2 ** -38))
+    put(ws, 113, 8, 0); put(ws, 121, 24, round(a["sqrta"] / 2 ** -11))
+    put(ws, 145, 24, round(a["omega0"] / PI / 2 ** -23)); put(ws, 169, 24, round(a["w"] / PI / 2 ** -23))
+    put(ws, 193, 24, round(a["m0"] / PI / 2 ** -23))
+    af0 = round(a["af0"] / 2 ** -20) & 0x7FF
+    put(ws, 217, 8, af0 >> 3); put(ws, 225, 11, round(a["af1"] / 2 ** -38)); put(ws, 236, 3, af0 & 7)
+    return fe2b(a["prn"], ws)
+
+
+def test_almanac_decode_and_double_copy():
+    import ephem
+    e = sim.constellation()["G"][5][0]
+    a = dict(prn=5, e=e["e"], toa=(e["toe"] // 4096) * 4096, di=e["i0"] - 0.30 * PI, omegadot=e["omegadot"],
+             sqrta=e["sqrta"], omega0=e["omega0"], w=e["w"], m0=e["m0"], af0=e["af0"], af1=0.0)
+    st = navmsg.AlmanacStore()
+    p = almanac_page(5, a)
+    assert st.feed(p) is None                               # one copy: not yet
+    got = st.feed(p)                                         # same content again: accepted
+    assert got and got["prn"] == 5 and math.isclose(got["sqrta"], a["sqrta"], abs_tol=2 ** -11)
+    assert math.isclose(got["af0"], a["af0"], abs_tol=2 ** -20)
+    eph = st.nav(sim.T0)["G"][5][0]
+    assert eph["alm"] and abs(eph["toe_g"] - sim.T0) < 302400
+    bad = bytearray(p); bad[20] ^= 0x40                      # a bit error is a different content
+    assert navmsg.AlmanacStore().feed(bytes(bad)) is None

@@ -86,6 +86,7 @@ gpspipe -w | head
 | `--cold` | cold start: no position needed |
 | `--download` / `--nav FILE` | broadcast ephemeris from IGS (needs network) / a local RINEX 3 nav file |
 | `--glonass` | also track GLONASS |
+| `--coarse lat,lon` | cold start: rough position (hundreds of km) to search the likely visible satellites first; default: the system timezone's city |
 | `--pty LINK` / `--nmea PATH` | NMEA (GGA, RMC, GSA) on a pty for gpsd / to a file or FIFO |
 | `--secs N` | stop after N seconds (default: run until stopped) |
 | `--log FILE` | log every chip message and solver event (large; useful for bug reports) |
@@ -210,6 +211,18 @@ Transmit times are kept in extended precision (`numpy.longdouble`): absolute GPS
 float64 resolve only 0.24 µs, i.e. 72 m of range. On platforms where `longdouble` is plain
 double (32-bit ARM), fixes are correspondingly noisier.
 
+### Almanac
+
+The GPS almanac (subframe 4 pages 2-5/7-10, subframe 5 pages 1-24) is decoded from the sky and
+cached in `almanac.json` next to the ephemeris cache (usable for weeks; pages are accepted when
+the same content has been decoded twice; satellites can carry different uploads). It is only
+used to aim the receiver, never for positioning:
+- position known but no current orbits (offline, cache older than 4 h): FE02 aiding from the
+  almanac (1-3 km orbit error, well inside the acquisition window). Outdoors, 5 satellites
+  locked within 13 s and the first fix came after about 100 s (orbits decoded from the sky).
+- cold start: with a coarse position (`--coarse`, or the timezone), the satellites likely above
+  the horizon are searched first instead of in a fixed order.
+
 ### Cold start
 
 Done as the stock engine does it, after capturing it with its aiding files deleted: no FE02 at
@@ -225,8 +238,6 @@ confirmed by a second consistent solution before ogps switches to the aided loop
 ## Known limits
 
 - Only one device and firmware tested.
-- No almanac decoding: cold starts take at least one full ephemeris broadcast (18-30 s with a
-  clean signal) per satellite.
 - FE30 and most FE08 sub-commands are not decoded; their stock values are sent.
 - The firmware does not tolerate time-inconsistent aiding: replaying captured stock commands
   (`replay.py`) makes it assert.

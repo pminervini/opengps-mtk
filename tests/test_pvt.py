@@ -75,3 +75,21 @@ def test_glonass_transmit_time_roundtrip():
         n = int(round((tod - s) * 0.511e6))
         m = dict(z=s & 0xFFFF, sub=n >> 16, tx_chips=n & 0xFFFF, sys=0x10)
         assert abs(float(pvt.tx_gps_time(m, t + 0.07) - pvt.LD(t))) < 1e-6, tod_target
+
+
+def test_almanac_search_order_puts_visible_first():
+    import navmsg, ogps
+    nav = sim.constellation()
+    d = ogps.Daemon.__new__(ogps.Daemon)
+    d.alm = navmsg.AlmanacStore()
+    for prn, (e,) in nav["G"].items():                       # almanac = the (simulated) orbits
+        d.alm.alm[prn] = dict(prn=prn, e=e["e"], toa=e["toe"], di=e["i0"] - 0.30 * navmsg.PI, omegadot=e["omegadot"],
+                              health=0, sqrta=e["sqrta"], omega0=e["omega0"], w=e["w"], m0=e["m0"], af0=e["af0"], af1=0.0)
+    d.coarse = np.array(ephem.geo2ecef(48.85, 2.35, 0))      # Paris: ~340 km from the receiver
+    ogps.now_gpst, saved = (lambda: sim.T0), ogps.now_gpst
+    try:
+        order = d.almanac_order()
+    finally:
+        ogps.now_gpst = saved
+    up = [prn for prn in nav["G"] if ephem.predict(nav, "G", prn, sim.T0, sim.RX)["el"] > 10]
+    assert set(up) <= set(order[:len(up) + 3])               # everything well up at the receiver is near the front
